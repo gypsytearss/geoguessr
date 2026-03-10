@@ -1,3 +1,8 @@
+# Project outputs (generated data and dashboards)
+outputs/
+games.json
+dashboard.html
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

@@ -3,6 +3,8 @@
 
 import json
 import math
+import os
+import sys
 from collections import defaultdict
 
 import plotly.graph_objects as go
@@ -14,7 +16,8 @@ import plotly.io as pio
 # Load data
 # ---------------------------------------------------------------------------
 
-def load_rounds(path: str = "games.json") -> list:
+def load_rounds(folder: str) -> list:
+    path = os.path.join(folder, "games.json")
     games = json.load(open(path))
     rounds = []
     for g in games:
@@ -425,12 +428,13 @@ def build_dashboard(rounds: list) -> go.Figure:
 # ---------------------------------------------------------------------------
 
 def main():
-    rounds = load_rounds("games.json")
-    print(f"Loaded {len(rounds)} rounds from games.json")
+    folder = sys.argv[1] if len(sys.argv) > 1 else "."
+    rounds = load_rounds(folder)
+    print(f"Loaded {len(rounds)} rounds from {folder}/games.json")
 
     fig = build_dashboard(rounds)
 
-    output = "dashboard.html"
+    output = os.path.join(folder, "dashboard.html")
     pio.write_html(fig, output, include_plotlyjs="cdn", full_html=True)
     print(f"Dashboard written to {output} — open in your browser")
 

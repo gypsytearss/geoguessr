@@ -9,7 +9,7 @@ import random
 import time
 import urllib.request
 import urllib.error
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import reverse_geocoder as rg
 
@@ -72,9 +72,6 @@ SUMMARY_URL = (
     "?token={game_id}"
 )
 
-# Fetch this many recent games (used during validation; switch to LOOKBACK_DAYS for full run)
-NUM_GAMES = 10
-
 # Human-like delay range between requests (seconds)
 DELAY_MIN = 2.0
 DELAY_MAX = 5.0
@@ -129,13 +126,12 @@ def fetch_json(url: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# History — fetch the N most recent game IDs
+# History — fetch game IDs by count or by days
 # ---------------------------------------------------------------------------
 
-def fetch_recent_game_ids(n: int) -> list:
+def fetch_game_ids_by_count(n: int) -> list:
     game_ids = []
     page = 0
-
     while len(game_ids) < n:
         history = fetch_json(HISTORY_URL.format(page=page))
         entries = history.get("entries", [])
@@ -146,7 +142,34 @@ def fetch_recent_game_ids(n: int) -> list:
             if len(game_ids) >= n:
                 break
         page += 1
+    return game_ids
 
+
+def fetch_game_ids_by_days(days: int) -> list:
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    game_ids = []
+    page = 0
+    while True:
+        history = fetch_json(HISTORY_URL.format(page=page))
+        entries = history.get("entries", [])
+        if not entries:
+            break
+        found_older = False
+        for entry in entries:
+            rounds = entry.get("duel", {}).get("rounds", [])
+            if not rounds:
+                continue
+            start_str = rounds[0].get("startTime", "")
+            if not start_str:
+                continue
+            start = datetime.strptime(start_str[:26], "%Y-%m-%dT%H:%M:%S.%f").replace(tzinfo=timezone.utc)
+            if start < cutoff:
+                found_older = True
+                break
+            game_ids.append(entry["gameId"])
+        if found_older:
+            break
+        page += 1
     return game_ids
 
 
@@ -255,12 +278,47 @@ def normalize_game(summary: dict) -> dict:
 # Main
 # ---------------------------------------------------------------------------
 
+def _prompt_query_mode():
+    """Ask user how to scope the fetch. Returns (mode, value, label)."""
+    while True:
+        mode = input("Fetch by (g)ames or (d)ays? [g/d]: ").strip().lower()
+        if mode in ("g", "d"):
+            break
+        print("  Enter 'g' or 'd'.")
+
+    if mode == "g":
+        while True:
+            try:
+                n = int(input("How many games? ").strip())
+                if n > 0:
+                    return "games", n, f"{n}-games"
+            except ValueError:
+                pass
+            print("  Enter a positive integer.")
+    else:
+        while True:
+            try:
+                n = int(input("How many days? ").strip())
+                if n > 0:
+                    return "days", n, f"{n}-days"
+            except ValueError:
+                pass
+            print("  Enter a positive integer.")
+
+
 def main():
+    mode, value, label = _prompt_query_mode()
+
     build_id = _fetch_build_id()
     print(f"Build ID: {build_id}")
 
-    print(f"Fetching {NUM_GAMES} most recent games ...")
-    game_ids = fetch_recent_game_ids(NUM_GAMES)
+    if mode == "games":
+        print(f"\nFetching {value} most recent games ...")
+        game_ids = fetch_game_ids_by_count(value)
+    else:
+        print(f"\nFetching games from the past {value} day(s) ...")
+        game_ids = fetch_game_ids_by_days(value)
+
     print(f"Found {len(game_ids)} game ID(s).\n")
 
     games = []
@@ -276,12 +334,17 @@ def main():
         except urllib.error.HTTPError as e:
             print(f"  [err] {game_id}: HTTP {e.code} {e.reason}")
 
-    output_path = "games.json"
-    with open(output_path, "w") as f:
+    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    out_dir = os.path.join("outputs", f"{date_str}_{label}")
+    os.makedirs(out_dir, exist_ok=True)
+
+    games_path = os.path.join(out_dir, "games.json")
+    with open(games_path, "w") as f:
         json.dump(games, f, indent=2)
 
     total_rounds = sum(len(g["rounds"]) for g in games)
-    print(f"\nSaved {len(games)} game(s), {total_rounds} round(s) to {output_path}")
+    print(f"\nSaved {len(games)} game(s), {total_rounds} round(s) to {games_path}")
+    print(f"Run dashboard:  python dashboard.py {out_dir}")
 
 
 if __name__ == "__main__":
