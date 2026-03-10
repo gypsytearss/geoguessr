@@ -72,9 +72,13 @@ SUMMARY_URL = (
     "?token={game_id}"
 )
 
-# Human-like delay range between requests (seconds)
-DELAY_MIN = 2.0
-DELAY_MAX = 5.0
+# Human-like delay between requests (seconds)
+DELAY_MIN = 3.0
+DELAY_MAX = 7.0
+# Every this many requests, take a longer reading pause
+LONG_PAUSE_EVERY = 10
+LONG_PAUSE_MIN = 12.0
+LONG_PAUSE_MAX = 22.0
 
 
 # ---------------------------------------------------------------------------
@@ -101,28 +105,46 @@ def _seed_cookies():
 _seed_cookies()
 
 _last_request_time: float = 0.0
+_request_count: int = 0
 
 
 def _human_delay():
-    global _last_request_time
-    elapsed = time.monotonic() - _last_request_time
-    delay = random.uniform(DELAY_MIN, DELAY_MAX)
-    remaining = delay - elapsed
-    if remaining > 0:
-        time.sleep(remaining)
+    global _last_request_time, _request_count
+    _request_count += 1
+
+    if _request_count > 1 and _request_count % LONG_PAUSE_EVERY == 0:
+        pause = random.uniform(LONG_PAUSE_MIN, LONG_PAUSE_MAX)
+        print(f"  [pause] Taking a {pause:.0f}s break after {_request_count} requests ...")
+        time.sleep(pause)
+    else:
+        elapsed = time.monotonic() - _last_request_time
+        delay = random.uniform(DELAY_MIN, DELAY_MAX)
+        remaining = delay - elapsed
+        if remaining > 0:
+            time.sleep(remaining)
+
     _last_request_time = time.monotonic()
+
+
+class RateLimitError(Exception):
+    pass
 
 
 def fetch_json(url: str) -> dict:
     _human_delay()
     req = urllib.request.Request(url, headers=HEADERS)
-    with _opener.open(req) as resp:
-        data = resp.read()
-        try:
-            data = gzip.decompress(data)
-        except OSError:
-            pass
-        return json.loads(data.decode())
+    try:
+        with _opener.open(req) as resp:
+            data = resp.read()
+            try:
+                data = gzip.decompress(data)
+            except OSError:
+                pass
+            return json.loads(data.decode())
+    except urllib.error.HTTPError as e:
+        if e.code in (400, 429):
+            raise RateLimitError(f"HTTP {e.code} — possible rate limit. Stopping to protect session.")
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +155,7 @@ def fetch_game_ids_by_count(n: int) -> list:
     game_ids = []
     page = 0
     while len(game_ids) < n:
-        history = fetch_json(HISTORY_URL.format(page=page))
+        history = fetch_json(HISTORY_URL.format(page=page))  # raises RateLimitError if blocked
         entries = history.get("entries", [])
         if not entries:
             break
@@ -150,7 +172,7 @@ def fetch_game_ids_by_days(days: int) -> list:
     game_ids = []
     page = 0
     while True:
-        history = fetch_json(HISTORY_URL.format(page=page))
+        history = fetch_json(HISTORY_URL.format(page=page))  # raises RateLimitError if blocked
         entries = history.get("entries", [])
         if not entries:
             break
@@ -322,6 +344,7 @@ def main():
     print(f"Found {len(game_ids)} game ID(s).\n")
 
     games = []
+    aborted = False
     for game_id in game_ids:
         url = SUMMARY_URL.format(build=build_id, game_id=game_id)
         try:
@@ -331,6 +354,11 @@ def main():
                 games.append(normalized)
                 rounds = normalized["rounds"]
                 print(f"  [ok] {game_id} — {len(rounds)} round(s), opponent: {normalized['opponent']['nick']}")
+        except RateLimitError as e:
+            print(f"\n  [abort] {e}")
+            print(f"  Saving {len(games)} game(s) collected so far ...")
+            aborted = True
+            break
         except urllib.error.HTTPError as e:
             print(f"  [err] {game_id}: HTTP {e.code} {e.reason}")
 
@@ -343,7 +371,8 @@ def main():
         json.dump(games, f, indent=2)
 
     total_rounds = sum(len(g["rounds"]) for g in games)
-    print(f"\nSaved {len(games)} game(s), {total_rounds} round(s) to {games_path}")
+    status = "PARTIAL — rate limited" if aborted else "complete"
+    print(f"\nSaved {len(games)} game(s), {total_rounds} round(s) to {games_path} [{status}]")
     print(f"Run dashboard:  python dashboard.py {out_dir}")
 
 
