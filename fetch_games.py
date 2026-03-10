@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""Fetch and normalize GeoGuessr duel data for the past 7 days."""
+"""Fetch and normalize GeoGuessr duel data."""
 
 import gzip
+import http.cookiejar
 import json
 import os
+import random
 import time
 import urllib.request
 import urllib.error
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
+
+import reverse_geocoder as rg
 
 
 # ---------------------------------------------------------------------------
@@ -35,7 +39,6 @@ MY_PLAYER_ID = os.environ.get("MY_PLAYER_ID", "")
 if not GG_TOKEN or not GG_NCFA:
     raise SystemExit("Missing GG_TOKEN or GG_NCFA — set them in .env")
 
-COOKIES = f"gg_token={GG_TOKEN}; _ncfa={GG_NCFA}"
 HEADERS = {
     "accept": "*/*",
     "accept-encoding": "gzip, deflate",
@@ -44,14 +47,24 @@ HEADERS = {
     "user-agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
+        "Chrome/144.0.0.0 Safari/537.36"
     ),
-    "cookie": COOKIES,
     "x-client": "web",
 }
 
-# Next.js build ID embedded in the site — update if requests 404
-NEXT_BUILD_ID = "XR9EfDQbg4KGrjm-PcLai"
+def _fetch_build_id() -> str:
+    """Fetch the current Next.js build ID from the GeoGuessr homepage."""
+    import re
+    req = urllib.request.Request(
+        "https://www.geoguessr.com/",
+        headers={"user-agent": HEADERS["user-agent"]},
+    )
+    with _opener.open(req) as resp:
+        html = resp.read().decode(errors="ignore")
+    match = re.search(r'"buildId":"([^"]+)"', html)
+    if not match:
+        raise SystemExit("Could not find Next.js buildId on GeoGuessr homepage")
+    return match.group(1)
 
 HISTORY_URL = "https://www.geoguessr.com/api/v4/game-history/me?gameMode=None&page={page}"
 SUMMARY_URL = (
@@ -59,25 +72,54 @@ SUMMARY_URL = (
     "?token={game_id}"
 )
 
-LOOKBACK_DAYS = 7
-REQUEST_DELAY = 0.1  # seconds between API calls
+# Fetch this many recent games (used during validation; switch to LOOKBACK_DAYS for full run)
+NUM_GAMES = 10
+
+# Human-like delay range between requests (seconds)
+DELAY_MIN = 2.0
+DELAY_MAX = 5.0
 
 
 # ---------------------------------------------------------------------------
-# HTTP helpers
+# HTTP — cookie jar tracks rolling _ncfa token automatically
 # ---------------------------------------------------------------------------
+
+_cookie_jar = http.cookiejar.CookieJar()
+_opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(_cookie_jar))
+
+
+def _seed_cookies():
+    for name, value in [("gg_token", GG_TOKEN), ("_ncfa", GG_NCFA)]:
+        cookie = http.cookiejar.Cookie(
+            version=0, name=name, value=value,
+            port=None, port_specified=False,
+            domain=".geoguessr.com", domain_specified=True, domain_initial_dot=True,
+            path="/", path_specified=True,
+            secure=True, expires=None, discard=True,
+            comment=None, comment_url=None, rest={},
+        )
+        _cookie_jar.set_cookie(cookie)
+
+
+_seed_cookies()
 
 _last_request_time: float = 0.0
 
 
-def fetch_json(url: str) -> dict:
+def _human_delay():
     global _last_request_time
     elapsed = time.monotonic() - _last_request_time
-    if elapsed < REQUEST_DELAY:
-        time.sleep(REQUEST_DELAY - elapsed)
+    delay = random.uniform(DELAY_MIN, DELAY_MAX)
+    remaining = delay - elapsed
+    if remaining > 0:
+        time.sleep(remaining)
     _last_request_time = time.monotonic()
+
+
+def fetch_json(url: str) -> dict:
+    _human_delay()
     req = urllib.request.Request(url, headers=HEADERS)
-    with urllib.request.urlopen(req) as resp:
+    with _opener.open(req) as resp:
         data = resp.read()
         try:
             data = gzip.decompress(data)
@@ -87,39 +129,36 @@ def fetch_json(url: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# History — paginate until entries older than cutoff
+# History — fetch the N most recent game IDs
 # ---------------------------------------------------------------------------
 
-def fetch_recent_game_ids(cutoff: datetime) -> list:
-    """Return game IDs for games started on or after cutoff."""
+def fetch_recent_game_ids(n: int) -> list:
     game_ids = []
     page = 0
 
-    while True:
+    while len(game_ids) < n:
         history = fetch_json(HISTORY_URL.format(page=page))
         entries = history.get("entries", [])
         if not entries:
             break
-
-        found_older = False
         for entry in entries:
-            rounds = entry.get("duel", {}).get("rounds", [])
-            if not rounds:
-                continue
-            start_str = rounds[0].get("startTime", "")
-            if not start_str:
-                continue
-            start = datetime.strptime(start_str[:26], "%Y-%m-%dT%H:%M:%S.%f").replace(tzinfo=timezone.utc)
-            if start < cutoff:
-                found_older = True
-                break
             game_ids.append(entry["gameId"])
-
-        if found_older:
-            break
+            if len(game_ids) >= n:
+                break
         page += 1
 
     return game_ids
+
+
+# ---------------------------------------------------------------------------
+# Reverse geocode a guess lat/lng to a country code (offline, no API calls)
+# ---------------------------------------------------------------------------
+
+def guess_country(lat, lng) -> str:
+    if lat is None or lng is None:
+        return ""
+    results = rg.search((lat, lng), verbose=False)
+    return results[0].get("cc", "").lower() if results else ""
 
 
 # ---------------------------------------------------------------------------
@@ -127,19 +166,12 @@ def fetch_recent_game_ids(cutoff: datetime) -> list:
 # ---------------------------------------------------------------------------
 
 def _find_my_player_id(game: dict) -> str:
-    """
-    Detect the current user's player ID from the summary.
-    The authenticated player has a non-null progressChange field.
-    Falls back to MY_PLAYER_ID env var if set.
-    """
     if MY_PLAYER_ID:
         return MY_PLAYER_ID
-
     for team in game.get("teams", []):
         for player in team.get("players", []):
             if player.get("progressChange") is not None:
                 return player["playerId"]
-
     return ""
 
 
@@ -150,7 +182,6 @@ def normalize_game(summary: dict) -> dict:
 
     my_id = _find_my_player_id(game)
 
-    # Build a flat lookup: player_id -> list of guesses keyed by round
     player_guesses = {}
     for team in game.get("teams", []):
         for player in team.get("players", []):
@@ -159,12 +190,7 @@ def normalize_game(summary: dict) -> dict:
                 g["roundNumber"]: g for g in player.get("guesses", [])
             }
 
-    # Identify opponent
-    opponent_id = next(
-        (pid for pid in player_guesses if pid != my_id), ""
-    )
-
-    # Resolve opponent nick from players list
+    opponent_id = next((pid for pid in player_guesses if pid != my_id), "")
     opponent_nick = ""
     for team in game.get("teams", []):
         for player in team.get("players", []):
@@ -179,6 +205,11 @@ def normalize_game(summary: dict) -> dict:
         my_guess = player_guesses.get(my_id, {}).get(rn)
         opp_guess = player_guesses.get(opponent_id, {}).get(rn)
 
+        my_lat = my_guess["lat"] if my_guess else None
+        my_lng = my_guess["lng"] if my_guess else None
+        opp_lat = opp_guess["lat"] if opp_guess else None
+        opp_lng = opp_guess["lng"] if opp_guess else None
+
         rounds.append({
             "round_number": rn,
             "actual": {
@@ -187,14 +218,16 @@ def normalize_game(summary: dict) -> dict:
                 "country_code": panorama.get("countryCode"),
             },
             "my_guess": {
-                "lat": my_guess["lat"] if my_guess else None,
-                "lng": my_guess["lng"] if my_guess else None,
+                "lat": my_lat,
+                "lng": my_lng,
+                "country_code": guess_country(my_lat, my_lng),
                 "distance_m": my_guess["distance"] if my_guess else None,
                 "score": my_guess["score"] if my_guess else None,
             },
             "opponent_guess": {
-                "lat": opp_guess["lat"] if opp_guess else None,
-                "lng": opp_guess["lng"] if opp_guess else None,
+                "lat": opp_lat,
+                "lng": opp_lng,
+                "country_code": guess_country(opp_lat, opp_lng),
                 "distance_m": opp_guess["distance"] if opp_guess else None,
                 "score": opp_guess["score"] if opp_guess else None,
             },
@@ -203,7 +236,11 @@ def normalize_game(summary: dict) -> dict:
     start_time = ""
     raw_rounds = game.get("rounds", [])
     if raw_rounds:
-        start_time = str(raw_rounds[0].get("startTime", ""))
+        raw_start = raw_rounds[0].get("startTime", "")
+        if isinstance(raw_start, (int, float)):
+            start_time = datetime.fromtimestamp(raw_start / 1000, tz=timezone.utc).isoformat()
+        else:
+            start_time = str(raw_start)
 
     return {
         "game_id": game["gameId"],
@@ -219,21 +256,23 @@ def normalize_game(summary: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 def main():
-    cutoff = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
-    print(f"Fetching games since {cutoff.date()} ...")
+    build_id = _fetch_build_id()
+    print(f"Build ID: {build_id}")
 
-    game_ids = fetch_recent_game_ids(cutoff)
-    print(f"Found {len(game_ids)} game(s) in the last {LOOKBACK_DAYS} days.\n")
+    print(f"Fetching {NUM_GAMES} most recent games ...")
+    game_ids = fetch_recent_game_ids(NUM_GAMES)
+    print(f"Found {len(game_ids)} game ID(s).\n")
 
     games = []
     for game_id in game_ids:
-        url = SUMMARY_URL.format(build=NEXT_BUILD_ID, game_id=game_id)
+        url = SUMMARY_URL.format(build=build_id, game_id=game_id)
         try:
             summary = fetch_json(url)
             normalized = normalize_game(summary)
             if normalized:
                 games.append(normalized)
-                print(f"  [ok] {game_id} — {len(normalized['rounds'])} round(s)")
+                rounds = normalized["rounds"]
+                print(f"  [ok] {game_id} — {len(rounds)} round(s), opponent: {normalized['opponent']['nick']}")
         except urllib.error.HTTPError as e:
             print(f"  [err] {game_id}: HTTP {e.code} {e.reason}")
 
@@ -241,7 +280,8 @@ def main():
     with open(output_path, "w") as f:
         json.dump(games, f, indent=2)
 
-    print(f"\nSaved {len(games)} game(s) to {output_path}")
+    total_rounds = sum(len(g["rounds"]) for g in games)
+    print(f"\nSaved {len(games)} game(s), {total_rounds} round(s) to {output_path}")
 
 
 if __name__ == "__main__":
