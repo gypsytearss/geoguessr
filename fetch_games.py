@@ -66,7 +66,7 @@ def _fetch_build_id() -> str:
         raise SystemExit("Could not find Next.js buildId on GeoGuessr homepage")
     return match.group(1)
 
-HISTORY_URL = "https://www.geoguessr.com/api/v4/game-history/me?gameMode=None&page={page}"
+FEED_URL = "https://www.geoguessr.com/api/v4/feed/private?count=50"
 SUMMARY_URL = (
     "https://www.geoguessr.com/_next/data/{build}/en/duels/{game_id}/summary.json"
     "?token={game_id}"
@@ -151,47 +151,74 @@ def fetch_json(url: str) -> dict:
 # History — fetch game IDs by count or by days
 # ---------------------------------------------------------------------------
 
+def _parse_feed_game_ids(entries: list) -> list:
+    """Extract (game_id, time) pairs for duel games from feed entries."""
+    results = []
+    seen = set()
+    for entry in entries:
+        payload_str = entry.get("payload", "")
+        if not payload_str:
+            continue
+        try:
+            items = json.loads(payload_str)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            p = item.get("payload", {})
+            if not isinstance(p, dict):
+                continue
+            if p.get("gameMode") == "Duels" and p.get("gameId"):
+                gid = p["gameId"]
+                if gid not in seen:
+                    seen.add(gid)
+                    results.append((gid, item.get("time", "")))
+    return results
+
+
+def _fetch_feed_page(pagination_token: str = "") -> tuple:
+    """Fetch one page of the private feed. Returns (pairs, next_token)."""
+    url = FEED_URL + (f"&paginationToken={pagination_token}" if pagination_token else "")
+    resp = fetch_json(url)
+    pairs = _parse_feed_game_ids(resp.get("entries", []))
+    return pairs, resp.get("paginationToken", "")
+
+
 def fetch_game_ids_by_count(n: int) -> list:
     game_ids = []
-    page = 0
+    token = ""
     while len(game_ids) < n:
-        history = fetch_json(HISTORY_URL.format(page=page))  # raises RateLimitError if blocked
-        entries = history.get("entries", [])
-        if not entries:
+        pairs, token = _fetch_feed_page(token)
+        if not pairs:
             break
-        for entry in entries:
-            game_ids.append(entry["gameId"])
+        for gid, _ in pairs:
+            game_ids.append(gid)
             if len(game_ids) >= n:
                 break
-        page += 1
+        if not token:
+            break
     return game_ids
 
 
 def fetch_game_ids_by_days(days: int) -> list:
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     game_ids = []
-    page = 0
+    token = ""
     while True:
-        history = fetch_json(HISTORY_URL.format(page=page))  # raises RateLimitError if blocked
-        entries = history.get("entries", [])
-        if not entries:
+        pairs, token = _fetch_feed_page(token)
+        if not pairs:
             break
         found_older = False
-        for entry in entries:
-            rounds = entry.get("duel", {}).get("rounds", [])
-            if not rounds:
-                continue
-            start_str = rounds[0].get("startTime", "")
-            if not start_str:
-                continue
-            start = datetime.strptime(start_str[:26], "%Y-%m-%dT%H:%M:%S.%f").replace(tzinfo=timezone.utc)
-            if start < cutoff:
-                found_older = True
-                break
-            game_ids.append(entry["gameId"])
-        if found_older:
+        for gid, time_str in pairs:
+            if time_str:
+                t = datetime.fromisoformat(time_str.rstrip("Z").split(".")[0]).replace(tzinfo=timezone.utc)
+                if t < cutoff:
+                    found_older = True
+                    break
+            game_ids.append(gid)
+        if found_older or not token:
             break
-        page += 1
     return game_ids
 
 
