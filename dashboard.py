@@ -168,7 +168,7 @@ def country_stats(rounds: list) -> dict:
 
 
 def confusion_matrix_data(rounds: list):
-    """Row-normalized confusion matrix using same labels on both axes."""
+    """Raw count confusion matrix with same labels on both axes so diagonal = correct guesses."""
     pairs = defaultdict(int)
     all_countries = set()
     for r in rounds:
@@ -184,17 +184,10 @@ def confusion_matrix_data(rounds: list):
     n = len(labels)
 
     counts = [[0] * n for _ in range(n)]
-    row_totals = defaultdict(int)
     for (actual, guessed), count in pairs.items():
-        row_totals[actual] += count
+        counts[idx[actual]][idx[guessed]] = count
 
-    normalized = [[0.0] * n for _ in range(n)]
-    for (actual, guessed), count in pairs.items():
-        i, j = idx[actual], idx[guessed]
-        counts[i][j] = count
-        normalized[i][j] = count / row_totals[actual]
-
-    return labels, normalized, counts
+    return labels, labels, counts
 
 
 def score_distribution(rounds: list) -> list:
@@ -230,7 +223,7 @@ def region_accuracy(rounds: list) -> list:
 
 def build_dashboard(rounds: list) -> go.Figure:
     stats = country_stats(rounds)
-    labels, matrix, counts = confusion_matrix_data(rounds)
+    row_labels, col_labels, counts = confusion_matrix_data(rounds)
     all_scores = score_distribution(rounds)
     region_acc = region_accuracy(rounds)
 
@@ -241,7 +234,7 @@ def build_dashboard(rounds: list) -> go.Figure:
             "Worst Countries (avg score, min 2 rounds)",
             "Me vs Opponent — Avg Score by Country",
             "Score Distribution",
-            "Country Confusion Matrix (row-normalized)",
+            "Country Confusion Matrix (raw counts)",
             "Region Accuracy — correct country guesses<br><sup>normalized distance / country radius (lower = better)</sup>",
             "Stats Summary", "",
         ),
@@ -305,17 +298,20 @@ def build_dashboard(rounds: list) -> go.Figure:
         showlegend=False,
     ), row=2, col=2)
 
-    # --- 5. Confusion matrix (row-normalized) ---
-    label_names = [name(cc) for cc in labels]
+    # --- 5. Confusion matrix (raw counts) ---
     fig.add_trace(go.Heatmap(
-        z=matrix,
-        x=label_names,
-        y=label_names,
-        colorscale="Reds",
-        zmin=0, zmax=1,
+        z=counts,
+        x=[name(cc) for cc in col_labels],
+        y=[name(cc) for cc in row_labels],
+        colorscale=[
+            [0.0, "#1a1a2e"],
+            [0.01, "#16213e"],
+            [0.3, "#e94560"],
+            [0.6, "#f5a623"],
+            [1.0, "#ffffff"],
+        ],
         showscale=True,
-        customdata=counts,
-        hovertemplate="Actual: %{y}<br>Guessed: %{x}<br>Rate: %{z:.0%}<br>Rounds: %{customdata}<extra></extra>",
+        hovertemplate="Actual: %{y}<br>Guessed: %{x}<br>Count: %{z}<extra></extra>",
         showlegend=False,
     ), row=3, col=1)
 
@@ -427,6 +423,85 @@ def build_dashboard(rounds: list) -> go.Figure:
 # Main
 # ---------------------------------------------------------------------------
 
+def build_country_accuracy_table(rounds: list) -> str:
+    """Build a sortable, scrollable HTML table of correct-country % per country."""
+    total = defaultdict(int)
+    correct = defaultdict(int)
+    confused_with = defaultdict(lambda: defaultdict(int))  # actual -> guessed -> count
+    for r in rounds:
+        actual = r["actual"]["country_code"]
+        guessed = r["my_guess"]["country_code"]
+        if actual:
+            total[actual] += 1
+            if guessed == actual:
+                correct[actual] += 1
+            elif guessed:
+                confused_with[actual][guessed] += 1
+
+    rows = []
+    for cc, t in total.items():
+        c = correct[cc]
+        pct = round(100 * c / t) if t else 0
+        # Top 3 confusions sorted by count desc
+        top3 = sorted(confused_with[cc].items(), key=lambda x: x[1], reverse=True)[:3]
+        top3_data = [[name(g), round(100 * cnt / t)] for g, cnt in top3]
+        rows.append((name(cc), t, c, pct, top3_data))
+
+    rows_json = json.dumps(rows)
+
+    return f"""
+<div style="max-width:600px; margin:40px auto; font-family:Arial,sans-serif;">
+  <h2 style="text-align:center; color:#2c3e50;">Correct Country % by Country</h2>
+  <div style="overflow-y:auto; max-height:500px; border:1px solid #ddd; border-radius:6px;">
+    <table id="ccTable" style="width:100%; border-collapse:collapse; font-size:13px;">
+      <thead style="position:sticky; top:0; background:#2c3e50; color:white; cursor:pointer;">
+        <tr>
+          <th onclick="sortTable(0)" style="padding:10px 14px; text-align:left;">Country &#x25F4;</th>
+          <th onclick="sortTable(1)" style="padding:10px 14px; text-align:right;">Rounds</th>
+          <th onclick="sortTable(2)" style="padding:10px 14px; text-align:right;">Correct</th>
+          <th onclick="sortTable(3)" style="padding:10px 14px; text-align:right;">%</th>
+          <th style="padding:10px 14px; text-align:left;">Top confusions</th>
+        </tr>
+      </thead>
+      <tbody id="ccBody"></tbody>
+    </table>
+  </div>
+</div>
+<script>
+  const rawRows = {rows_json};
+  let sortCol = 3, sortAsc = false;
+
+  function renderTable() {{
+    const sorted = [...rawRows].sort((a, b) => {{
+      const av = a[sortCol], bv = b[sortCol];
+      return sortAsc ? (av > bv ? 1 : -1) : (av < bv ? 1 : -1);
+    }});
+    const colors = ['#e74c3c','#e67e22','#f1c40f','#2ecc71'];
+    document.getElementById('ccBody').innerHTML = sorted.map(r => {{
+      const pct = r[3];
+      const color = pct < 25 ? colors[0] : pct < 50 ? colors[1] : pct < 75 ? colors[2] : colors[3];
+      const confusions = r[4].map(c => `${{c[0]}} (${{c[1]}}%)`).join(', ') || '—';
+      return `<tr style="border-bottom:1px solid #eee;">
+        <td style="padding:8px 14px;">${{r[0]}}</td>
+        <td style="padding:8px 14px; text-align:right;">${{r[1]}}</td>
+        <td style="padding:8px 14px; text-align:right;">${{r[2]}}</td>
+        <td style="padding:8px 14px; text-align:right; font-weight:bold; color:${{color}}">${{pct}}%</td>
+        <td style="padding:8px 14px; color:#7f8c8d; font-size:12px;">${{confusions}}</td>
+      </tr>`;
+    }}).join('');
+  }}
+
+  function sortTable(col) {{
+    if (sortCol === col) sortAsc = !sortAsc;
+    else {{ sortCol = col; sortAsc = col === 0; }}
+    renderTable();
+  }}
+
+  renderTable();
+</script>
+"""
+
+
 def main():
     folder = sys.argv[1] if len(sys.argv) > 1 else "."
     rounds = load_rounds(folder)
@@ -435,7 +510,12 @@ def main():
     fig = build_dashboard(rounds)
 
     output = os.path.join(folder, "dashboard.html")
-    pio.write_html(fig, output, include_plotlyjs="cdn", full_html=True)
+    # Write chart, then append the sortable table
+    chart_html = pio.to_html(fig, include_plotlyjs="cdn", full_html=True)
+    table_html = build_country_accuracy_table(rounds)
+    final_html = chart_html.replace("</body>", table_html + "\n</body>")
+    with open(output, "w") as f:
+        f.write(final_html)
     print(f"Dashboard written to {output} — open in your browser")
 
 

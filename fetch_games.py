@@ -73,8 +73,8 @@ SUMMARY_URL = (
 )
 
 # Human-like delay between requests (seconds)
-DELAY_MIN = 3.0
-DELAY_MAX = 7.0
+DELAY_MIN = 1.0
+DELAY_MAX = 4.0
 # Every this many requests, take a longer reading pause
 LONG_PAUSE_EVERY = 10
 LONG_PAUSE_MIN = 12.0
